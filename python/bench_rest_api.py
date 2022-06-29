@@ -15,6 +15,7 @@ from novaclient import api_versions
 from novaclient import exceptions as novaclient_exceptions
 
 import logging
+import pdb
 
 # this script is used to determine if there is still enough
 # resource a given flavor
@@ -22,7 +23,7 @@ import logging
 logging.basicConfig(
     filename='/tmp/output.log',
     format='%(asctime)s %(name)s: %(levelname)s %(message)s',
-    level=logging.INFO, datefmt='%Y-%m-%d %H:%M:%S')
+    level=logging.DEBUG, datefmt='%Y-%m-%d %H:%M:%S')
 
 LOG = logging.getLogger(__name__)
 CONSUMER_GENERATION_VERSION = '1.28'
@@ -59,6 +60,7 @@ class ClientProxy(object):
             self.username, self.password, self.project_name,
             auth_url=self.auth_url,
             region_name=self.region_name,
+            endpoint_override=self.endpoint_override,
             insecure=True
         )
         self._compute = nova_client.Client(
@@ -168,7 +170,7 @@ def register_opts(conf):
     conf.register_cli_opt(
         cfg.IntOpt(
             'limit',
-            default=1
+            default=20
         )
     )
     conf.register_cli_opt(
@@ -211,7 +213,7 @@ def cprofile_decorator(f):
             if limit in __results[f.__name__]:
                 last = __results[f.__name__][limit][-1]
                 __results[f.__name__][limit].append(
-                    (last[0] + 1, last[1] + pstats.Stats(pr).total_tt))
+                    (last[0] + 1, pstats.Stats(pr).total_tt))
             else:
                 __results[f.__name__][limit] = [(1, pstats.Stats(pr).total_tt)]
         else:
@@ -225,6 +227,27 @@ def init():
 
 
 @cprofile_decorator
+def test_rest_all_tenants_volume(times, limit, client):
+    client.volumes.list(
+        search_opts={
+            "all_tenants": True
+        },
+        limit=limit
+    )
+
+
+@cprofile_decorator
+def test_rest_all_tenants_volume_with_detail(times, limit, client):
+    client.volumes.list(
+        detailed=True,
+        search_opts={
+            "all_tenants": True
+        },
+        limit=limit
+    )
+
+
+@cprofile_decorator
 def test_rest_all_tenants(times, limit, client):
     client.servers.list(
         search_opts={
@@ -232,6 +255,7 @@ def test_rest_all_tenants(times, limit, client):
         },
         limit=limit
     )
+
 
 @cprofile_decorator
 def test_rest_all_tenants_new(times, limit, client):
@@ -282,15 +306,16 @@ def main():
         new_client = ClientProxy(cfg.CONF, endpoint_override=cfg.CONF.alternative_endpoint)
 
     # start benchmarking
-    l = 1
-    while l <= cfg.CONF.limit + cfg.CONF.step_size:
+    l = cfg.CONF.step_size
+    while l <= cfg.CONF.limit:
         t = 1
         while t <= cfg.CONF.times:
-            test_rest_all_tenants(1, l, client)
-            test_rest_active_all_tenants(1, l, client)
+            test_rest_all_tenants_volume(1, l, client)
+            test_rest_all_tenants_volume_with_detail(1, l, client)
+            # test_rest_active_all_tenants(1, l, client)
             if new_client:
                 test_rest_active_all_tenants_new(1, l, new_client)
-                test_rest_all_tenants_new(1, l, new_client)
+                # test_rest_all_tenants_new(1, l, new_client)
             t += 1
         l += cfg.CONF.step_size
     output()
@@ -298,3 +323,6 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+# python bench_rest_api.py --limit 60  --step-size 10 --times 3  --output /tmp/results-test --endpoint-type internal --alternative-endpoint "100.101.89.208:8776/v3"

@@ -132,7 +132,9 @@ class FaultyDevicesCleaner(object):
 
     def _get_non_ncpu_target_info_map(self):
         # Group the paths by target_info_key
+        # ncpu_target_info_set is empty when driver is fujitsu
         ncpu_target_info_set = self._get_ncpu_emc_target_info_set()
+        # device_paths is empty when driver is fujitsu
         device_paths = self._get_emc_device_paths()
         target_info_map = {}
         for path in device_paths:
@@ -171,6 +173,7 @@ class FaultyDevicesCleaner(object):
                 print("Warning: Unable to delete %s." % real_path)
 
     def _cleanup_faulty_paths(self):
+        # non_ncpu_target_info_map is empty when driver is fujitsu
         non_ncpu_target_info_map = self._get_non_ncpu_target_info_map()
         for paths in non_ncpu_target_info_map.itervalues():
             if self._all_related_paths_faulty(paths):
