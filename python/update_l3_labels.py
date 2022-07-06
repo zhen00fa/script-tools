@@ -8,7 +8,7 @@ This example demonstrates the following:
 
 import logging
 from kubernetes import client, config, watch
-from concurrent.futures import FIRST_COMPLETED
+from concurrent.futures import FIRST_COMPLETED, ALL_COMPLETED, FIRST_EXCEPTION
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import wait
 import json
@@ -17,11 +17,17 @@ from oslo_config import cfg
 import socket
 import sys
 import time
+import paramiko
 
 
 # global configuration
 POOL_SIZE = 10
 POD_START_TIMEOUT = 240
+SSH_PORT = 6233
+SSH_USER = "root"
+SSH_PKEY = "/etc/kubernetes/common/private_key"
+SSH_PASSWD = None
+
 LOG_SYMBOL = "neutron_inspur.agents.acl.l3.acl_l3_agent [-] Process router add, router_id"
 
 
@@ -74,7 +80,15 @@ def register_opts(conf):
         cfg.StrOpt(
             'rsType',
             default="daemonset",
-            help='step size of pod restarting'
+            help='resource controller type'
+        )
+    )
+    conf.register_cli_opt(
+        cfg.StrOpt(
+            'metadataLabel',
+            required=True,
+            default="",
+            help='metadata label of pod'
         )
     )
     # init
@@ -83,10 +97,24 @@ def register_opts(conf):
     )
 
 
+def ssh_connect(hostname):
+    ssh = paramiko.SSHClient()
+    cmd = "ip netns |grep qrouter-"
+    private_key = paramiko.RSAKey.from_private_key_file(SSH_PKEY)
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh.connect(hostname=hostname, port=SSH_PORT, username=SSH_USER, password=SSH_PASSWD, pkey=private_key)
+    stdin, stdout, stderr = ssh.exec_command(cmd)
+    out = stdout.readlines()
+    err = stderr.readlines()
+    ssh.close()
+    return out, err
+
+
 class PodHandler(object):
     def __init__(self, hostname, oldlabel=None, newlabel=None):
         config.load_kube_config()
         self.api_instance = client.CoreV1Api()
+        self.watch = watch.Watch
         self.hostname = hostname
         if oldlabel is not None:
             self.oldlabel = oldlabel
@@ -96,10 +124,11 @@ class PodHandler(object):
         self.launcher_pod = []
 
     def list_pods(self):
+        # list namespaced pods
         pod_list = self.api_instance.\
             list_namespaced_pod(namespace=cfg.CONF.namespace,
                                 field_selector="spec.nodeName" + "=" + self.hostname,
-                                label_selector=cfg.CONF.oldSelector)
+                                label_selector=cfg.CONF.metadataLabel)
         return pod_list.items
 
     def _patch_node_label_and_wait(self, key, value, status):
@@ -118,16 +147,65 @@ class PodHandler(object):
         for pod in old_pods:
             self.api_instance.delete_namespaced_pod(pod.metadata.name,
                                                     cfg.CONF.namespace)
-            self._wait_pod_state(pod.metadata.name)
+            self._wait_pod_state(pod.metadata.name, "running")
 
     def _wait_pod_state(self, pod_id, tgt_state):
         start_time = time.time()
         if tgt_state == 'deleted':
             while time.time() - start_time < POD_START_TIMEOUT:
-                pass
+                try:
+                    self.api_instance.read_namespaced_pod(pod_id, cfg.CONF.namespace)
+                except client.exceptions.ApiException as e:
+                    if e.reason == "Not Found":
+                        LOG.info("pod %s deleted successfully")
+                        break
+            else:
+                LOG.error("pod %s did not successfully remove after %d seconds.", pod_id, POD_START_TIMEOUT)
+                raise Exception
+
         if tgt_state == 'running':
-            return pod_id
-            pass
+            while time.time() - start_time < POD_START_TIMEOUT:
+                pod_ready = self._watch_pod_state(pod_id)
+                if pod_ready:
+                    break
+            else:
+                LOG.error("pod %s did not reach state running start after %d seconds.", POD_START_TIMEOUT)
+                raise Exception
+
+    def _watch_pod_state(self, pod):
+        for event in self.watch.stream(self.list_pods()):
+            event_type = event['type'].upper()
+            pod_name = event['object'].metadata.name
+            if event_type in {'ADDED', 'MODIFIED'}:
+                status = event['object'].status
+                if pod_name != pod:
+                    pod_ready = True
+                    if LOG_SYMBOL:
+                        pod_ready = self.get_logs(pod_name)
+                    else:
+                        pod_phase = status.phase
+                        if (pod_phase == 'Succeeded' or
+                                (pod_phase == 'Running' and
+                                 self._get_pod_condition(
+                                     status.conditions, 'Ready') == 'True')):
+                            LOG.info('Pod %s is ready!', pod_name)
+                        else:
+                            pod_ready = False
+                    return pod_ready
+            elif event_type == 'ERROR':
+                LOG.error('Pod %s: Got error event %s', pod_name, event['object'].to_dict())
+                raise Exception('Got error event for pod: %s' % event['object'])
+            else:
+                LOG.error('Unrecognized event type (%s) for pod: %s',
+                          event_type, event['object'])
+                raise Exception(
+                    'Got unknown event type (%s) for pod: %s'
+                    % (event_type, event['object']))
+
+    def _get_pod_condition(self, pod_conditions, condition_type):
+        for pc in pod_conditions:
+            if pc.type == condition_type:
+                return pc.status
 
     def manage_pod(self):
         if cfg.CONF.onlyRestartPod:
@@ -140,13 +218,12 @@ class PodHandler(object):
         key, value = self.newlabel.split('=')
         self._patch_node_label_and_wait(key, value, 'running')
 
-    def get_logs(self):
-        w = watch.Watch()
+    def get_logs(self, pod_name):
 
-        for line in w.stream(self.api_instance.read_namespaced_pod_log,
-                             name=self.launcher_pod,
-                             namespace=cfg.CONF.namespace,
-                             timestamps=True):
+        for line in self.watch.stream(self.api_instance.read_namespaced_pod_log,
+                                      name=pod_name,
+                                      namespace=cfg.CONF.namespace,
+                                      timestamps=True):
             if LOG_SYMBOL in line:
                 # Once we get the symbol log, return true.
                 print(line, end="\n")
@@ -165,7 +242,7 @@ class ThreadPoolExecutorWithLimit(ThreadPoolExecutor):
     def submit(self, fn, *args, **kwargs):
         if len(self._task_futures) >= self._limit:
             done, self._task_futures = wait(self._task_futures,
-                                            return_when=FIRST_COMPLETED)
+                                            return_when=ALL_COMPLETED)
         future = super(ThreadPoolExecutorWithLimit, self).submit(fn, *args,
                                                                  **kwargs)
         self._task_futures.add(future)
