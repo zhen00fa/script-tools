@@ -48,6 +48,9 @@ LOG = logging.getLogger(__name__)
 
 def init():
     register_opts(cfg.CONF)
+    if not cfg.CONF.onlyRestartPod and not cfg.CONF.newSelector:
+        LOG.error("newSelector need be given when NOT onlyRestartPod")
+        raise Exception
 
 
 def register_opts(conf):
@@ -169,7 +172,7 @@ class PodHandler(object):
                     self.api_instance.read_namespaced_pod(pod_id, cfg.CONF.namespace)
                 except client.exceptions.ApiException as e:
                     if e.reason == "Not Found":
-                        LOG.info("pod %s deleted successfully")
+                        LOG.info("pod %s deleted successfully", pod_id)
                         break
                     else:
                         raise
@@ -198,18 +201,18 @@ class PodHandler(object):
             if event_type in {'ADDED', 'MODIFIED'}:
                 status = event['object'].status
                 if pod_name != pod:
-                    if LOG_SYMBOL and ssh_get_qrouter(self.hostname):
-                        pod_ready = self.get_logs(pod_name)
-                    else:
-                        pod_phase = status.phase
-                        if (pod_phase == 'Succeeded' or
-                                (pod_phase == 'Running' and
-                                 self._get_pod_condition(
-                                     status.conditions, 'Ready') == 'True')):
+                    pod_phase = status.phase
+                    if (pod_phase == 'Succeeded' or
+                            (pod_phase == 'Running' and
+                             self._get_pod_condition(
+                                 status.conditions, 'Ready') == 'True')):
+                        if LOG_SYMBOL and ssh_get_qrouter(self.hostname):
+                            return self.get_logs(pod_name)
+                        else:
                             LOG.info('Pod %s is ready!', pod_name)
                             return True
-                        else:
-                            continue
+                    else:
+                        continue
             elif event_type == 'ERROR':
                 LOG.error('Pod %s: Got error event %s', pod_name, event['object'].to_dict())
                 raise Exception('Got error event for pod: %s' % event['object'])
@@ -248,25 +251,31 @@ class PodHandler(object):
                 self._patch_node_label_and_wait(key, value, 'running')
                 write_result_to_file(self.hostname, FILE_SUCCESS)
             except Exception as e:
-                LOG.error('patch node to delete pods meets error: %s', e)
+                LOG.error('patch node to restart pods meets error: %s', e)
+                logging.exception(e)
                 write_result_to_file(self.hostname, FILE_FAILED)
                 raise
 
     def get_logs(self, pod_name):
+        start_time = time.time()
         w = watch.Watch()
         for line in w.stream(self.api_instance.read_namespaced_pod_log,
                              name=pod_name,
                              namespace=cfg.CONF.namespace,
-                             timestamps=True,
-                             timeout_seconds=POD_START_TIMEOUT):
+                             timestamps=True):
             if LOG_SYMBOL in line:
                 # Once we get the symbol log, return true.
                 print(line, end="\n")
+                LOG.info('Pod %s is ready!', pod_name)
                 return True
-        else:
-            return False
-            # print(line, end="\n")
-            # if "INFO:: Training completed." in line:
+            if time.time() - start_time > POD_START_TIMEOUT - 5:
+                LOG.error('Pod %s never get expected log after %d seconds!', pod_name, POD_START_TIMEOUT - 5)
+                w.stop()
+                return False
+        # else:
+        #     return False
+        #     # print(line, end="\n")
+        #     # if "INFO:: Training completed." in line:
 
 
 def write_result_to_file(node, file):
@@ -331,12 +340,11 @@ if __name__ == '__main__':
 
 
 # Usage:
-# restart pods by update labels
-# python3 update_l3_labels.py --metadataLabel "application=neutron,component=l3-agent"
-# --oldSelector "node-role.kubernetes.io/l3-node=enabled"
-# --nodeSelector "node-role.kubernetes.io/l3-node=for-upgrade"
 
-# just restart pods
+# restart pods by update labels:
+# python3 update_l3_labels.py --metadataLabel "application=neutron,component=l3-agent" --oldSelector "node-role.kubernetes.io/l3-node=enabled" --newSelector "node-role.kubernetes.io/l3-node=for-upgrade" --maxWorkers 3
+
+# just restart pods:
 # python3 update_l3_labels.py --metadataLabel "application=neutron,component=l3-agent"
 # --oldSelector "node-role.kubernetes.io/l3-node=enabled"
 # --onlyRestartPod
