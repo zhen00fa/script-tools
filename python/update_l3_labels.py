@@ -6,11 +6,14 @@ This example demonstrates the following:
     - Restart pods by patching node-label and wait pod stats
 """
 
+
+import fcntl
 import logging
 from kubernetes import client, config, watch
 from concurrent.futures import FIRST_COMPLETED, ALL_COMPLETED, FIRST_EXCEPTION
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import wait
+from multiprocessing import Pool
 import json
 import base64
 from oslo_config import cfg
@@ -18,6 +21,14 @@ import socket
 import sys
 import time
 import paramiko
+import os
+
+
+WORKSPACE = '/opt/restart_pods'
+if not os.path.exists(WORKSPACE):
+    os.makedirs(WORKSPACE)
+FILE_SUCCESS = os.path.join(WORKSPACE, 'node_success')
+FILE_FAILED = os.path.join(WORKSPACE, 'node_failed')
 
 
 # global configuration
@@ -28,8 +39,8 @@ SSH_USER = "root"
 SSH_PKEY = "/etc/kubernetes/common/private_key"
 SSH_PASSWD = None
 
-LOG_SYMBOL = "neutron_inspur.agents.acl.l3.acl_l3_agent [-] Process router add, router_id"
-
+# LOG_SYMBOL = "neutron_inspur.agents.acl.l3.acl_l3_agent [-] Process router add, router_id"
+LOG_SYMBOL = ""
 
 logging.basicConfig(level=logging.INFO)
 LOG = logging.getLogger(__name__)
@@ -51,6 +62,7 @@ def register_opts(conf):
         cfg.StrOpt(
             'newSelector',
             required=True,
+            default="",
             help='new node selector labels'
         )
     )
@@ -97,7 +109,7 @@ def register_opts(conf):
     )
 
 
-def ssh_connect(hostname):
+def ssh_get_qrouter(hostname):
     ssh = paramiko.SSHClient()
     cmd = "ip netns |grep qrouter-"
     private_key = paramiko.RSAKey.from_private_key_file(SSH_PKEY)
@@ -114,13 +126,13 @@ class PodHandler(object):
     def __init__(self, hostname, oldlabel=None, newlabel=None):
         config.load_kube_config()
         self.api_instance = client.CoreV1Api()
-        self.watch = watch.Watch
         self.hostname = hostname
         if oldlabel is not None:
             self.oldlabel = oldlabel
         if newlabel is not None:
             self.newlabel = newlabel
-        self.pods = []
+        # get old pods
+        self.pods = self.list_pods()
         self.launcher_pod = []
 
     def list_pods(self):
@@ -143,8 +155,8 @@ class PodHandler(object):
             self._wait_pod_state(pod.metadata.name, status)
 
     def _terminate_pods(self):
-        old_pods = self.list_pods()
-        for pod in old_pods:
+        for pod in self.pods:
+            LOG.info("delete pod %s", pod.metadata.name)
             self.api_instance.delete_namespaced_pod(pod.metadata.name,
                                                     cfg.CONF.namespace)
             self._wait_pod_state(pod.metadata.name, "running")
@@ -159,28 +171,34 @@ class PodHandler(object):
                     if e.reason == "Not Found":
                         LOG.info("pod %s deleted successfully")
                         break
+                    else:
+                        raise
             else:
                 LOG.error("pod %s did not successfully remove after %d seconds.", pod_id, POD_START_TIMEOUT)
                 raise Exception
 
         if tgt_state == 'running':
-            while time.time() - start_time < POD_START_TIMEOUT:
-                pod_ready = self._watch_pod_state(pod_id)
-                if pod_ready:
-                    break
+            pod_ready = self._watch_pod_state(pod_id)
+            if pod_ready:
+                pass
             else:
-                LOG.error("pod %s did not reach state running start after %d seconds.", POD_START_TIMEOUT)
+                # LOG.error("pod %s did not reach state running start after %d seconds.", POD_START_TIMEOUT)
                 raise Exception
 
     def _watch_pod_state(self, pod):
-        for event in self.watch.stream(self.list_pods()):
+        w = watch.Watch()
+        pod_ready = False
+        for event in w.stream(self.api_instance.list_namespaced_pod,
+                              namespace=cfg.CONF.namespace,
+                              field_selector="spec.nodeName" + "=" + self.hostname,
+                              label_selector=cfg.CONF.metadataLabel,
+                              timeout_seconds=POD_START_TIMEOUT):
             event_type = event['type'].upper()
             pod_name = event['object'].metadata.name
             if event_type in {'ADDED', 'MODIFIED'}:
                 status = event['object'].status
                 if pod_name != pod:
-                    pod_ready = True
-                    if LOG_SYMBOL:
+                    if LOG_SYMBOL and ssh_get_qrouter(self.hostname):
                         pod_ready = self.get_logs(pod_name)
                     else:
                         pod_phase = status.phase
@@ -189,18 +207,20 @@ class PodHandler(object):
                                  self._get_pod_condition(
                                      status.conditions, 'Ready') == 'True')):
                             LOG.info('Pod %s is ready!', pod_name)
+                            return True
                         else:
-                            pod_ready = False
-                    return pod_ready
+                            continue
             elif event_type == 'ERROR':
                 LOG.error('Pod %s: Got error event %s', pod_name, event['object'].to_dict())
                 raise Exception('Got error event for pod: %s' % event['object'])
-            else:
-                LOG.error('Unrecognized event type (%s) for pod: %s',
-                          event_type, event['object'])
-                raise Exception(
-                    'Got unknown event type (%s) for pod: %s'
-                    % (event_type, event['object']))
+        else:
+            return pod_ready
+            # else:
+                # LOG.error('Unrecognized event type (%s) for pod: %s',
+                #           event_type, event['object'])
+                # raise Exception(
+                #     'Got unknown event type (%s) for pod: %s'
+                #     % (event_type, event['object']))
 
     def _get_pod_condition(self, pod_conditions, condition_type):
         for pc in pod_conditions:
@@ -209,27 +229,60 @@ class PodHandler(object):
 
     def manage_pod(self):
         if cfg.CONF.onlyRestartPod:
-            self._terminate_pods()
-            return
-        # terminate pod by removing old label
-        key, value = self.oldlabel.split('=')
-        self._patch_node_label_and_wait(key, None, 'deleted')
-        # start pod by patching new label
-        key, value = self.newlabel.split('=')
-        self._patch_node_label_and_wait(key, value, 'running')
+            try:
+                self._terminate_pods()
+                write_result_to_file(self.hostname, FILE_SUCCESS)
+            except Exception as e:
+                LOG.error('terminating pods meets error: %s', e)
+                logging.exception(e)
+                write_result_to_file(self.hostname, FILE_FAILED)
+                raise
+
+        else:
+            try:
+                # terminate pod by removing old label
+                key, value = self.oldlabel.split('=')
+                self._patch_node_label_and_wait(key, None, 'deleted')
+                # start pod by patching new label
+                key, value = self.newlabel.split('=')
+                self._patch_node_label_and_wait(key, value, 'running')
+                write_result_to_file(self.hostname, FILE_SUCCESS)
+            except Exception as e:
+                LOG.error('patch node to delete pods meets error: %s', e)
+                write_result_to_file(self.hostname, FILE_FAILED)
+                raise
 
     def get_logs(self, pod_name):
-
-        for line in self.watch.stream(self.api_instance.read_namespaced_pod_log,
-                                      name=pod_name,
-                                      namespace=cfg.CONF.namespace,
-                                      timestamps=True):
+        w = watch.Watch()
+        for line in w.stream(self.api_instance.read_namespaced_pod_log,
+                             name=pod_name,
+                             namespace=cfg.CONF.namespace,
+                             timestamps=True,
+                             timeout_seconds=POD_START_TIMEOUT):
             if LOG_SYMBOL in line:
                 # Once we get the symbol log, return true.
                 print(line, end="\n")
                 return True
+        else:
+            return False
             # print(line, end="\n")
             # if "INFO:: Training completed." in line:
+
+
+def write_result_to_file(node, file):
+    with open(file, encoding='utf-8', mode='a') as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        f.write(node + '\n')
+
+
+def read_file(path):
+    with open(path, 'r') as f:
+        lines = f.readlines()
+        dict_tag_list = []
+        for line in lines:
+            line = line.strip('\n')
+            dict_tag_list.append(line)
+    return dict_tag_list
 
 
 class ThreadPoolExecutorWithLimit(ThreadPoolExecutor):
@@ -242,7 +295,7 @@ class ThreadPoolExecutorWithLimit(ThreadPoolExecutor):
     def submit(self, fn, *args, **kwargs):
         if len(self._task_futures) >= self._limit:
             done, self._task_futures = wait(self._task_futures,
-                                            return_when=ALL_COMPLETED)
+                                            return_when=FIRST_COMPLETED)
         future = super(ThreadPoolExecutorWithLimit, self).submit(fn, *args,
                                                                  **kwargs)
         self._task_futures.add(future)
@@ -263,9 +316,11 @@ def main():
 
     executor = ThreadPoolExecutorWithLimit(max_workers=cfg.CONF.maxWorkers)
 
-    for node in node_list.items():
-        ph = PodHandler(node.metadata.name, cfg.CONF.oldSelector, cfg.CONF.newSelector)
-        executor.submit(ph.manage_pod)
+    for node in node_list.items:
+        done_nodes = read_file(FILE_SUCCESS)
+        if node.metadata.name not in done_nodes:
+            ph = PodHandler(node.metadata.name, cfg.CONF.oldSelector, cfg.CONF.newSelector)
+            executor.submit(ph.manage_pod)
 
 
 if __name__ == '__main__':
@@ -276,4 +331,12 @@ if __name__ == '__main__':
 
 
 # Usage:
-#
+# restart pods by update labels
+# python3 update_l3_labels.py --metadataLabel "application=neutron,component=l3-agent"
+# --oldSelector "node-role.kubernetes.io/l3-node=enabled"
+# --nodeSelector "node-role.kubernetes.io/l3-node=for-upgrade"
+
+# just restart pods
+# python3 update_l3_labels.py --metadataLabel "application=neutron,component=l3-agent"
+# --oldSelector "node-role.kubernetes.io/l3-node=enabled"
+# --onlyRestartPod
