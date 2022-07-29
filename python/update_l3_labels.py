@@ -191,6 +191,7 @@ class PodHandler(object):
     def _watch_pod_state(self, pod):
         w = watch.Watch()
         pod_ready = False
+        new_pod_name = ""
         for event in w.stream(self.api_instance.list_namespaced_pod,
                               namespace=cfg.CONF.namespace,
                               field_selector="spec.nodeName" + "=" + self.hostname,
@@ -206,24 +207,24 @@ class PodHandler(object):
                             (pod_phase == 'Running' and
                              self._get_pod_condition(
                                  status.conditions, 'Ready') == 'True')):
-                        if LOG_SYMBOL and ssh_get_qrouter(self.hostname):
-                            return self.get_logs(pod_name)
+                        need_get_log = LOG_SYMBOL and ssh_get_qrouter(self.hostname)
+                        if need_get_log:
+                            new_pod_name = pod_name
+                            w.stop()
+                            break
                         else:
                             LOG.info('Pod %s is ready!', pod_name)
+                            w.stop()
                             return True
                     else:
                         continue
             elif event_type == 'ERROR':
+                w.stop()
                 LOG.error('Pod %s: Got error event %s', pod_name, event['object'].to_dict())
                 raise Exception('Got error event for pod: %s' % event['object'])
-        else:
-            return pod_ready
-            # else:
-                # LOG.error('Unrecognized event type (%s) for pod: %s',
-                #           event_type, event['object'])
-                # raise Exception(
-                #     'Got unknown event type (%s) for pod: %s'
-                #     % (event_type, event['object']))
+        if need_get_log:
+            pod_ready = get_logs(new_pod_name)
+        return pod_ready
 
     def _get_pod_condition(self, pod_conditions, condition_type):
         for pc in pod_conditions:
@@ -240,14 +241,15 @@ class PodHandler(object):
                 logging.exception(e)
                 write_result_to_file(self.hostname, FILE_FAILED)
                 raise
-
         else:
             try:
                 # terminate pod by removing old label
                 key, value = self.oldlabel.split('=')
+                LOG.info("remove label %s on node %s", self.oldlabel, self.hostname)
                 self._patch_node_label_and_wait(key, None, 'deleted')
                 # start pod by patching new label
                 key, value = self.newlabel.split('=')
+                LOG.info("add label %s on node %s", self.newlabel, self.hostname)
                 self._patch_node_label_and_wait(key, value, 'running')
                 write_result_to_file(self.hostname, FILE_SUCCESS)
             except Exception as e:
@@ -256,26 +258,27 @@ class PodHandler(object):
                 write_result_to_file(self.hostname, FILE_FAILED)
                 raise
 
-    def get_logs(self, pod_name):
-        start_time = time.time()
-        w = watch.Watch()
-        for line in w.stream(self.api_instance.read_namespaced_pod_log,
-                             name=pod_name,
-                             namespace=cfg.CONF.namespace,
-                             timestamps=True):
-            if LOG_SYMBOL in line:
-                # Once we get the symbol log, return true.
-                print(line, end="\n")
-                LOG.info('Pod %s is ready!', pod_name)
+
+def get_logs(pod_name):
+    config.load_kube_config()
+    api_instance = client.CoreV1Api()
+    start_time = time.time()
+    while time.time() - start_time < POD_START_TIMEOUT - 5:
+        try:
+            logs = api_instance.read_namespaced_pod_log(name=pod_name,
+                                                        namespace=cfg.CONF.namespace,
+                                                        timestamps=True)
+            if LOG_SYMBOL in logs:
+                LOG.info("Get symbol log! Pod %s is ready", pod_name)
                 return True
-            if time.time() - start_time > POD_START_TIMEOUT - 5:
-                LOG.error('Pod %s never get expected log after %d seconds!', pod_name, POD_START_TIMEOUT - 5)
-                w.stop()
-                return False
-        # else:
-        #     return False
-        #     # print(line, end="\n")
-        #     # if "INFO:: Training completed." in line:
+            time.sleep(10)
+        except Exception as e:
+            LOG.error("Meets error when getting logs for pod %s %s", pod_name, e)
+            time.sleep(10)
+            pass
+    else:
+        LOG.error("pod %s did not get expected log after %d seconds.", pod_name, POD_START_TIMEOUT - 5)
+        return False
 
 
 def write_result_to_file(node, file):
