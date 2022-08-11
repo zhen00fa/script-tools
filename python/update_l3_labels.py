@@ -24,32 +24,49 @@ import paramiko
 import os
 
 
-WORKSPACE = '/opt/restart_pods'
+WORKSPACE = '/opt/restart_pods/'
 if not os.path.exists(WORKSPACE):
     os.makedirs(WORKSPACE)
 FILE_SUCCESS = os.path.join(WORKSPACE, 'node_success')
 FILE_FAILED = os.path.join(WORKSPACE, 'node_failed')
+if not os.path.exists(FILE_SUCCESS):
+    file = open(FILE_SUCCESS, 'w')
+    file.close()
+if not os.path.exists(FILE_FAILED):
+    file = open(FILE_FAILED, 'w')
+    file.close()
 
 
 # global configuration
 POOL_SIZE = 10
-POD_START_TIMEOUT = 240
+POD_START_TIMEOUT = 600
 SSH_PORT = 6233
 SSH_USER = "root"
 SSH_PKEY = "/etc/kubernetes/common/private_key"
 SSH_PASSWD = None
 
+KUBE_CONFIG_FILE = None
+
+# 3.1.x
 # LOG_SYMBOL = "neutron_inspur.agents.acl.l3.acl_l3_agent [-] Process router add, router_id"
-LOG_SYMBOL = ""
+# After 3.5
+# LOG_SYMBOL = "Finished a router update for"
+LOG_SYMBOL = "L3 agent started"
 
 logging.basicConfig(level=logging.INFO)
 LOG = logging.getLogger(__name__)
+fh = logging.FileHandler(WORKSPACE + 'update_l3_labels.log')
+fh.setLevel(logging.INFO)
+LOG.addHandler(fh)
 
 
 def init():
     register_opts(cfg.CONF)
     if not cfg.CONF.onlyRestartPod and not cfg.CONF.newSelector:
         LOG.error("newSelector need be given when NOT onlyRestartPod")
+        raise Exception
+    if cfg.CONF.matchLog and not LOG_SYMBOL:
+        LOG.error("Restarting pod need match log, but no symbol log provided")
         raise Exception
 
 
@@ -88,7 +105,14 @@ def register_opts(conf):
         cfg.BoolOpt(
             'onlyRestartPod',
             default=False,
-            help='step size of pod restarting'
+            help=''
+        )
+    )
+    conf.register_cli_opt(
+        cfg.BoolOpt(
+            'matchLog',
+            default=False,
+            help=''
         )
     )
     conf.register_cli_opt(
@@ -122,12 +146,15 @@ def ssh_get_qrouter(hostname):
     out = stdout.readlines()
     err = stderr.readlines()
     ssh.close()
-    return out, err
+    if out:
+        return True
+    else:
+        return False
 
 
 class PodHandler(object):
     def __init__(self, hostname, oldlabel=None, newlabel=None):
-        config.load_kube_config()
+        config.load_kube_config(config_file=KUBE_CONFIG_FILE)
         self.api_instance = client.CoreV1Api()
         self.hostname = hostname
         if oldlabel is not None:
@@ -192,6 +219,7 @@ class PodHandler(object):
         w = watch.Watch()
         pod_ready = False
         new_pod_name = ""
+        need_get_log = False
         for event in w.stream(self.api_instance.list_namespaced_pod,
                               namespace=cfg.CONF.namespace,
                               field_selector="spec.nodeName" + "=" + self.hostname,
@@ -207,7 +235,7 @@ class PodHandler(object):
                             (pod_phase == 'Running' and
                              self._get_pod_condition(
                                  status.conditions, 'Ready') == 'True')):
-                        need_get_log = LOG_SYMBOL and ssh_get_qrouter(self.hostname)
+                        need_get_log = cfg.CONF.matchLog and ssh_get_qrouter(self.hostname)
                         if need_get_log:
                             new_pod_name = pod_name
                             w.stop()
@@ -259,26 +287,29 @@ class PodHandler(object):
                 raise
 
 
+def edit_cke_node():
+    pass
+
+
 def get_logs(pod_name):
-    config.load_kube_config()
+    config.load_kube_config(config_file=KUBE_CONFIG_FILE)
     api_instance = client.CoreV1Api()
     start_time = time.time()
-    while time.time() - start_time < POD_START_TIMEOUT - 5:
-        try:
-            logs = api_instance.read_namespaced_pod_log(name=pod_name,
-                                                        namespace=cfg.CONF.namespace,
-                                                        timestamps=True)
-            if LOG_SYMBOL in logs:
-                LOG.info("Get symbol log! Pod %s is ready", pod_name)
-                return True
-            time.sleep(10)
-        except Exception as e:
-            LOG.error("Meets error when getting logs for pod %s %s", pod_name, e)
-            time.sleep(10)
-            pass
-    else:
-        LOG.error("pod %s did not get expected log after %d seconds.", pod_name, POD_START_TIMEOUT - 5)
-        return False
+    w = watch.Watch()
+    for line in w.stream(api_instance.read_namespaced_pod_log,
+                         name=pod_name,
+                         namespace=cfg.CONF.namespace,
+                         timestamps=True):
+        if LOG_SYMBOL in line:
+            # Once we get the symbol log, return true.
+            print(line, end="\n")
+            w.stop()
+            LOG.info('Get symbol log! Pod %s is ready!', pod_name)
+            return True
+        if time.time() - start_time > POD_START_TIMEOUT - 5:
+            LOG.error('Pod %s never get expected log after %d seconds!', pod_name, POD_START_TIMEOUT - 5)
+            w.stop()
+            return False
 
 
 def write_result_to_file(node, file):
@@ -317,7 +348,7 @@ class ThreadPoolExecutorWithLimit(ThreadPoolExecutor):
 def main():
     init()
 
-    config.load_kube_config()
+    config.load_kube_config(config_file=KUBE_CONFIG_FILE)
 
     api_instance = client.CoreV1Api()
 
