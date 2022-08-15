@@ -45,19 +45,22 @@ SSH_USER = "root"
 SSH_PKEY = "/etc/kubernetes/common/private_key"
 SSH_PASSWD = None
 
-KUBE_CONFIG_FILE = None
 
-# 3.1.x
-# LOG_SYMBOL = "neutron_inspur.agents.acl.l3.acl_l3_agent [-] Process router add, router_id"
-# After 3.5
-# LOG_SYMBOL = "Finished a router update for"
-LOG_SYMBOL = "L3 agent started"
+if cfg.CONF.icpVersion >= 3.5:
+    # After 3.5
+    LOG_SYMBOL = "neutron_inspur.agents.acl.l3.acl_l3_agent [-] Process router add, router_id"
+else:
+    # 3.1.x
+    LOG_SYMBOL = "Finished a router update for"
 
 logging.basicConfig(level=logging.INFO)
 LOG = logging.getLogger(__name__)
 fh = logging.FileHandler(WORKSPACE + 'update_l3_labels.log')
 fh.setLevel(logging.INFO)
 LOG.addHandler(fh)
+
+# load k8s config
+KUBE_CONFIG_FILE = None
 
 
 def init():
@@ -130,6 +133,14 @@ def register_opts(conf):
             help='metadata label of pod'
         )
     )
+    conf.register_cli_opt(
+        cfg.FloatOpt(
+            'icpVersion',
+            required=True,
+            # default=3.1,
+            help='metadata label of pod'
+        )
+    )
     # init
     conf(
         project='update-l3-labels'
@@ -154,8 +165,6 @@ def ssh_get_qrouter(hostname):
 
 class PodHandler(object):
     def __init__(self, hostname, oldlabel=None, newlabel=None):
-        config.load_kube_config(config_file=KUBE_CONFIG_FILE)
-        self.api_instance = client.CoreV1Api()
         self.hostname = hostname
         if oldlabel is not None:
             self.oldlabel = oldlabel
@@ -167,7 +176,9 @@ class PodHandler(object):
 
     def list_pods(self):
         # list namespaced pods
-        pod_list = self.api_instance.\
+        config.load_kube_config(config_file=KUBE_CONFIG_FILE)
+        api_instance = client.CoreV1Api()
+        pod_list = api_instance.\
             list_namespaced_pod(namespace=cfg.CONF.namespace,
                                 field_selector="spec.nodeName" + "=" + self.hostname,
                                 label_selector=cfg.CONF.metadataLabel)
@@ -180,23 +191,32 @@ class PodHandler(object):
                     key: value}
             }
         }
-        self.api_instance.patch_node(self.hostname, body)
+        if cfg.CONF.icpVersion >= 3.5:
+            edit_cke_node(self.hostname, key, value)
+        else:
+            config.load_kube_config(config_file=KUBE_CONFIG_FILE)
+            api_instance = client.CoreV1Api()
+            api_instance.patch_node(self.hostname, body)
         for pod in self.pods:
             self._wait_pod_state(pod.metadata.name, status)
 
     def _terminate_pods(self):
+        config.load_kube_config(config_file=KUBE_CONFIG_FILE)
+        api_instance = client.CoreV1Api()
         for pod in self.pods:
             LOG.info("delete pod %s", pod.metadata.name)
-            self.api_instance.delete_namespaced_pod(pod.metadata.name,
-                                                    cfg.CONF.namespace)
+            api_instance.delete_namespaced_pod(pod.metadata.name,
+                                               cfg.CONF.namespace)
             self._wait_pod_state(pod.metadata.name, "running")
 
     def _wait_pod_state(self, pod_id, tgt_state):
+        config.load_kube_config(config_file=KUBE_CONFIG_FILE)
+        api_instance = client.CoreV1Api()
         start_time = time.time()
         if tgt_state == 'deleted':
             while time.time() - start_time < POD_START_TIMEOUT:
                 try:
-                    self.api_instance.read_namespaced_pod(pod_id, cfg.CONF.namespace)
+                    api_instance.read_namespaced_pod(pod_id, cfg.CONF.namespace)
                 except client.exceptions.ApiException as e:
                     if e.reason == "Not Found":
                         LOG.info("pod %s deleted successfully", pod_id)
@@ -217,10 +237,12 @@ class PodHandler(object):
 
     def _watch_pod_state(self, pod):
         w = watch.Watch()
+        config.load_kube_config(config_file=KUBE_CONFIG_FILE)
+        api_instance = client.CoreV1Api()
         pod_ready = False
         new_pod_name = ""
         need_get_log = False
-        for event in w.stream(self.api_instance.list_namespaced_pod,
+        for event in w.stream(api_instance.list_namespaced_pod,
                               namespace=cfg.CONF.namespace,
                               field_selector="spec.nodeName" + "=" + self.hostname,
                               label_selector=cfg.CONF.metadataLabel,
@@ -287,8 +309,24 @@ class PodHandler(object):
                 raise
 
 
-def edit_cke_node():
-    pass
+def edit_cke_node(node_name, label, val):
+    config.load_kube_config(config_file=KUBE_CONFIG_FILE)
+    api_exten = client.CustomObjectsApi()
+    try:
+        body = {
+            "metadata": {
+                "labels": {
+                    label: val
+                }
+            }
+        }
+        api_exten.patch_namespaced_custom_object(group="cke.inspur.com", version="v1alpha1",
+                                                 namespace="kube-system",
+                                                 plural="ckenodes", name=node_name,
+                                                 body=body)
+    except client.exceptions.ApiException as e:
+        if e.reason == "Not Found":
+            LOG.info("Cke node $s not defined", node_name)
 
 
 def get_logs(pod_name):
@@ -347,11 +385,8 @@ class ThreadPoolExecutorWithLimit(ThreadPoolExecutor):
 
 def main():
     init()
-
     config.load_kube_config(config_file=KUBE_CONFIG_FILE)
-
     api_instance = client.CoreV1Api()
-
     # Listing the nodes that matching label selector
     node_list = api_instance.list_node(label_selector=cfg.CONF.oldSelector)
 
@@ -375,8 +410,11 @@ if __name__ == '__main__':
 
 # Usage:
 
-# restart pods by update labels:
-# python3 update_l3_labels.py --metadataLabel "application=neutron,component=l3-agent" --oldSelector "node-role.kubernetes.io/l3-node=enabled" --newSelector "node-role.kubernetes.io/l3-node=for-upgrade" --maxWorkers 3
+# restart pods by updating labels:
+# python3 update_l3_labels.py --metadataLabel "application=neutron,component=l3-agent"
+# --oldSelector "node-role.kubernetes.io/l3-node=enabled"
+# --newSelector "node-role.kubernetes.io/l3-node=for-upgrade"
+# --maxWorkers 3
 
 # just restart pods:
 # python3 update_l3_labels.py --metadataLabel "application=neutron,component=l3-agent"
