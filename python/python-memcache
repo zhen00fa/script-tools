@@ -1,0 +1,11 @@
+from pymemcache.client.base import Client
+
+client = Client(('memcached.openstack.svc.region-jinan-lab.myinspurcloud.com', 11211))
+
+result = client.stats()
+result = client.get(''b'__TOOZ_LOCK_cinder-84d67d66-71fb-4672-90a1-4e3edaa72f32-delete_volume''')
+
+
+
+
+

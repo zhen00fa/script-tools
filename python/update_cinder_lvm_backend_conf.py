@@ -81,40 +81,6 @@ additional_parameter = 'volume_clear_size = 1'
 PURGE_OLD_DS = False  # 如果要同时删除旧的ds，请设置为true
 
 
-# def compare_secret(old, new):
-#     if old and new:
-#         data_old = str(base64.b64decode(old), "utf-8")
-#         data_new = str(base64.b64decode(new), "utf-8")
-#         set_old = set([line for line in data_old.strip().split('\n')])
-#         set_new = set([line for line in data_new.strip().split('\n')])
-#         if len(set_old - set_new) == 2:
-#             str1 = str(set_old - set_new)
-#             if additional_parameter[0] in str1:
-#                 if additional_parameter[1] in str1:
-#                     return True
-#         else:
-#             LOG.error("Compare secrets %s %s failed, please check", data_old, data_new)
-#     return False
-
-
-# def patch_secret(v1, legal_secret_name, illegal_secret_name):
-#     illegal_secret = v1.read_namespaced_secret(illegal_secret_name, "openstack")
-#     if not illegal_secret:
-#         raise Exception("Secret %s does not exist", illegal_secret_name)
-#     legal_secret = v1.read_namespaced_secret(legal_secret_name, "openstack")
-#     if not legal_secret:
-#         raise Exception("Secret %s does not exist", legal_secret_name)
-#     data1 = illegal_secret.data.get('backends.conf')
-#     data2 = legal_secret.data.get('backends.conf')
-#     if data1 and data2:
-#         if compare_secret(data1, data2):
-#             body = json.dump(data_tmpl) % data1
-#             v1.patch_namespaced_secret(legal_secret_name, "openstack", body)
-#         else:
-#             raise Exception
-#     else:
-#         raise Exception("Secret do not have sub-secret backends.conf")
-
 def handle_secret(new):
     data_1 = str(base64.b64decode(new), "utf-8")
     new_List = [line for line in data_1.strip().split('\n')]
@@ -139,14 +105,10 @@ def compare_secret(new):
 
 
 def patch_secret(v1, legal_secret_name):
-    # illegal_secret = v1.read_namespaced_secret(illegal_secret_name, "openstack")
-    # if not illegal_secret:
-    #     raise Exception("Secret %s does not exist", illegal_secret_name)
     LOG.info("Patching secret %s", legal_secret_name)
     legal_secret = v1.read_namespaced_secret(legal_secret_name, "openstack")
     if not legal_secret:
         raise Exception("Secret %s does not exist", legal_secret_name)
-    # data1 = illegal_secret.data.get('backends.conf')
     data2 = legal_secret.data.get('backends.conf')
     if data2:
         if compare_secret(data2):

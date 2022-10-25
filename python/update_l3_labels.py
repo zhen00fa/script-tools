@@ -45,13 +45,11 @@ SSH_USER = "root"
 SSH_PKEY = "/etc/kubernetes/common/private_key"
 SSH_PASSWD = None
 
-
-if cfg.CONF.icpVersion >= 3.5:
-    # After 3.5
-    LOG_SYMBOL = "neutron_inspur.agents.acl.l3.acl_l3_agent [-] Process router add, router_id"
-else:
-    # 3.1.x
-    LOG_SYMBOL = "Finished a router update for"
+LOG_SYMBOL = ""
+# 3.1.x
+# LOG_SYMBOL = "neutron_inspur.agents.acl.l3.acl_l3_agent [-] Process router add, router_id"
+# After 3.5
+# LOG_SYMBOL = "Finished a router update for"
 
 logging.basicConfig(level=logging.INFO)
 LOG = logging.getLogger(__name__)
@@ -370,6 +368,7 @@ class ThreadPoolExecutorWithLimit(ThreadPoolExecutor):
     def __init__(self, max_workers):
         self._task_futures = set()
         self._limit = max_workers
+        self._fail_futures = set()
         LOG.debug("max_workers: %s", max_workers)
         super(ThreadPoolExecutorWithLimit, self).__init__(max_workers)
 
@@ -377,6 +376,14 @@ class ThreadPoolExecutorWithLimit(ThreadPoolExecutor):
         if len(self._task_futures) >= self._limit:
             done, self._task_futures = wait(self._task_futures,
                                             return_when=FIRST_COMPLETED)
+            for future in done:
+                worker_exception = future.exception()
+                if worker_exception:
+                    logging.exception("Worker return exception: {}".format(worker_exception))
+                    self._fail_futures.add(future)
+            if self._fail_futures:
+                self.shutdown()
+
         future = super(ThreadPoolExecutorWithLimit, self).submit(fn, *args,
                                                                  **kwargs)
         self._task_futures.add(future)
@@ -387,10 +394,8 @@ def main():
     init()
     config.load_kube_config(config_file=KUBE_CONFIG_FILE)
     api_instance = client.CoreV1Api()
-    # Listing the nodes that matching label selector
+    # Listing the nodes that match label selector
     node_list = api_instance.list_node(label_selector=cfg.CONF.oldSelector)
-
-    # print("%s\t\t%s" % ("NAME", "LABELS"))
 
     executor = ThreadPoolExecutorWithLimit(max_workers=cfg.CONF.maxWorkers)
 

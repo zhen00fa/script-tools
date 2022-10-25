@@ -5,6 +5,9 @@ from keystoneauth1 import loading, session
 from novaclient import client # require version >= 10.0.0
 from keystoneclient.v3 import client as kclient
 from neutronclient.v2_0 import client as neutronc
+from concurrent.futures import FIRST_COMPLETED, ALL_COMPLETED, FIRST_EXCEPTION
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait
 import time
 import os
 
@@ -119,6 +122,18 @@ def wait_for_server_status(server_id, timeout=400, interval=5):
 #     return project.name
 
 
+def create_port(network_id):
+    name = 'lz-test-' + ''.join(random.sample(string.ascii_letters + string.digits, 6))
+    body = {
+        "port": {
+            'network_id': network_id,
+            'name': name
+        }
+    }
+    port = neutron_client.create_port(body).get('port')
+    port_id = port.get('id')
+
+
 def create_floatingipaddr(network_id, port_id):
     body = {
         "floatingip": {
@@ -147,24 +162,27 @@ def main():
         tmpl = [{'net-id': huge_vpc1}, {'net-id': huge_vpc2}]
         used_projects = []
         used_nets = []
-        for i in range(4):
-            print(projects[i])
-            if i == 0:
-                try:
-                    router = get_router(projects[i])
-                    if router:
-                        neutron_client.add_gateway_router(router, {'network_id': floating})
-                except Exception as e:
-                    print("add external gateway for router failed in project " + projects[i])
-                    print("error message:", e)
-                    pass
-            network_id = get_network(projects[i])
-            tmpl.append({'net-id': network_id})
-            used_projects.append(projects[i])
-            used_nets.append(network_id)
+        # for i in range(4):
+        #     print(projects[i])
+        #     if i == 0:
+        #         try:
+        #             router = get_router(projects[i])
+        #             if router:
+        #                 neutron_client.add_gateway_router(router, {'network_id': floating})
+        #         except Exception as e:
+        #             print("add external gateway for router failed in project " + projects[i])
+        #             print("error message:", e)
+        #             pass
+        #     network_id = get_network(projects[i])
+        #     tmpl.append({'net-id': network_id})
+        #     used_projects.append(projects[i])
+        #     used_nets.append(network_id)
 
         server = nova_client.servers.create(name=name, flavor=flavor, image=image, nics=tmpl, availability_zone=az)
-        wait_for_server_status(server.id)
+        try:
+            wait_for_server_status(server.id)
+        except Exception:
+            continue
 
         write_to_file(server.id, "/home/lz/create_servers/servers")
         # add floating ip
@@ -178,12 +196,6 @@ def main():
                     create_floatingipaddr(service_data, port_obj.port_id)
                 if port_obj.net_id == used_nets[0]:
                     create_floatingipaddr(floating, port_obj.port_id)
-            # fip_add1, fip_id1 = create_floatingipaddr(floating)
-            # server.add_floating_ip(fip_add1)
-            # fip_add2, fip_id2 = create_floatingipaddr(floating)
-            # server.add_floating_ip(fip_add2)
-            # fip_add3, fip_id3 = create_floatingipaddr(service_data)
-            # server.add_floating_ip(fip_add3)
         except Exception as e:
             print("add floating ip error: %s", e)
         # soft reboot
